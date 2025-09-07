@@ -2,10 +2,10 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"golang.org/x/net/html/charset"
@@ -13,74 +13,100 @@ import (
 
 type Entry struct{ Header, Text, Url string }
 
-var author_url string = "https://stihi.ru/avtor/dashkov"
-var links_collection []string = nil
+const stihiBaseHost = "https://stihi.ru/"
 
 func main() {
-	links_collection = collectLinks(author_url, 3500)
-	total := len(links_collection)
+	var (
+		linksCollection []string
+		authorUrl       = stihiBaseHost + "avtor/dashkov"
+	)
+
+	linksCollection, err := collectLinksConc(authorUrl, 3500)
+	if err != nil {
+		fmt.Printf("ошибка сбора ссылок %v", err)
+		return
+	}
+
+	total := len(linksCollection)
 	fmt.Println(total)
 
-	for i, entry_url := range links_collection {
-		entry_page := ParsePage(entry_url)
-		entry := ReadEntry(entry_page, entry_url)
-		SaveEntry("archive.txt", entry)
-		if cent := i % 100; cent == 0 {
+	for i, entryUrl := range linksCollection {
+		entryPage, err := parsePage(entryUrl)
+		if err != nil {
+			fmt.Printf("ошибка парсинга страницы %v", err)
+			continue
+		}
+
+		err = saveEntry("archive.txt", readEntry(entryPage, entryUrl))
+		if err != nil {
+			fmt.Printf("не удалось сохранить запись %s: %v", entryUrl, err)
+		}
+
+		if i%100 == 0 {
 			fmt.Println(i)
 		}
 	}
 }
 
-func collectLinks(base_url string, max_pages int) (collection []string) {
-	for i := 0; i <= max_pages; i += 50 {
-		page_url := base_url + "&s=" + strconv.Itoa(i)
-		doc := ParsePage(page_url)
+func collectLinksConc(baseURL string, maxPages int) ([]string, error) {
+	var links []string
+
+	for i := 0; i <= maxPages; i += 50 {
+		pageURL := baseURL + "&s=" + strconv.Itoa(i)
+
+		doc, err := parsePage(pageURL)
+		if err != nil {
+			return nil, fmt.Errorf("пропускаю страницу %s из-за ошибки: %v", pageURL, err)
+		}
+
 		doc.Find(".maintext index ul li").Each(func(i int, s *goquery.Selection) {
-			link, _ := s.Find("a").Attr("href")
-			collection = append(collection, "https://stihi.ru/"+link)
+			if link, exists := s.Find("a").Attr("href"); exists {
+				links = append(links, stihiBaseHost+link)
+			}
 		})
 	}
 
-	return collection
+	return links, nil
 }
 
-func ReadEntry(doc *goquery.Document, entry_url string) (entry Entry) {
+func readEntry(doc *goquery.Document, entryUrl string) (entry Entry) {
 	entry.Header = doc.Find(".maintext index h1").Text()
 	entry.Text = doc.Find(".maintext index .text").Text()
-	entry.Url = entry_url
+	entry.Url = entryUrl
 
 	return entry
 }
 
-func ParsePage(url string) (doc *goquery.Document) {
-	// Request the HTML page.
-	res, err := http.Get(url)
-	if err != nil {
-		log.Fatal(err)
+func parsePage(url string) (*goquery.Document, error) {
+	time.Sleep(10 * time.Millisecond)
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
 	}
 
+	res, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка HTTP запроса: %w", err)
+	}
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		log.Fatalf("status code error: %d %s", res.StatusCode, res.Status)
+		return nil, fmt.Errorf("статус ответа: %d %s", res.StatusCode, res.Status)
 	}
 
 	utf8Reader, err := charset.NewReader(res.Body, res.Header.Get("Content-Type"))
 	if err != nil {
-		log.Fatalf("ошибка преобразования кодировки: %v", err)
+		return nil, fmt.Errorf("ошибка преобразования кодировки: %v", err)
 	}
 
-	// Load the HTML document
-	doc, err = goquery.NewDocumentFromReader(utf8Reader)
-
+	doc, err := goquery.NewDocumentFromReader(utf8Reader)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("ошибка парсинга страницы: %v", err)
 	}
-
-	return doc
+	return doc, nil
 }
 
-func SaveEntry(filename string, entry Entry) error {
+func saveEntry(filename string, entry Entry) error {
 	// Открываем файл для добавления (если не существует - создается)
 	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -90,7 +116,7 @@ func SaveEntry(filename string, entry Entry) error {
 
 	_, err = fmt.Fprintf(file, "*****\n\n%s\n%s\n%s\n\n", entry.Header, entry.Text, entry.Url)
 	if err != nil {
-		log.Fatalf("failed to write to file: %v", err)
+		return fmt.Errorf("ошибка записи в файл: %w", err)
 	}
 
 	return nil
